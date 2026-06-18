@@ -391,7 +391,7 @@ static int add_interface_local(struct ctx *ctx, int ifindex);
 static int del_interface(struct link *link);
 static int rename_interface(struct ctx *ctx, struct link *link, int ifindex);
 static int change_net_interface(struct ctx *ctx, int ifindex, uint32_t old_net);
-static int add_local_eid(struct ctx *ctx, uint32_t net, int eid , int ifindex);
+static int add_local_eid(struct ctx *ctx, uint32_t net, int eid);
 static int del_local_eid(struct ctx *ctx, uint32_t net, int eid);
 static int add_net(struct ctx *ctx, uint32_t net);
 static void del_net(struct net *net);
@@ -2064,9 +2064,7 @@ static int cb_listen_monitor(sd_event_source *s, int sd, uint32_t revents,
 
 		case MCTP_NL_ADD_EID: {
 			uint32_t net = mctp_nl_net_byindex(ctx->nl, c->ifindex);
-			warnx("Adding local EID %d on interface %d (net %d)", c->eid,
-			      c->ifindex, net);
-			rc = add_local_eid(ctx, net, c->eid, c->ifindex);
+			rc = add_local_eid(ctx, net, c->eid);
 			any_error |= (rc < 0);
 			break;
 		}
@@ -6667,7 +6665,7 @@ static int change_net_interface(struct ctx *ctx, int ifindex, uint32_t old_net)
 }
 
 // Adds one local EID
-static int add_local_eid(struct ctx *ctx, uint32_t net, int eid , int ifindex)
+static int add_local_eid(struct ctx *ctx, uint32_t net, int eid)
 {
 	struct peer *peer;
 	int rc;
@@ -6696,7 +6694,6 @@ static int add_local_eid(struct ctx *ctx, uint32_t net, int eid , int ifindex)
 	}
 	peer->state = LOCAL;
 	peer->local_count = 1;
-	peer->phys.ifindex = ifindex;
 	rc = peer_set_uuid(peer, ctx->uuid);
 	if (rc < 0) {
 		warnx("Failed setting local UUID: %s", strerror(-rc));
@@ -6749,7 +6746,7 @@ static int add_interface_local(struct ctx *ctx, int ifindex)
 	}
 	eids = mctp_nl_addrs_byindex(ctx->nl, ifindex, &num);
 	for (size_t j = 0; j < num; j++) {
-		add_local_eid(ctx, net, eids[j], ifindex);
+		add_local_eid(ctx, net, eids[j]);
 	}
 
 	// Add new link if required
