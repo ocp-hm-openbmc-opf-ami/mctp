@@ -112,9 +112,10 @@ enum mctp_astpcie_msg_routing {
 #define PCIE_ROUTE_TO_RC_PHY_ADDRESS(addr) \
 	if ((addr)->smctp_halen == 3) { \
 		struct sockaddr_mctp_ext * p_addr = (struct sockaddr_mctp_ext *) (addr); \
+		uint8_t tmp = p_addr->smctp_haddr[1]; \
 		p_addr->smctp_haddr[0] = PCIE_ROUTE_TO_RC; \
-		p_addr->smctp_haddr[1] = 0; \
-		p_addr->smctp_haddr[2] = 0; \
+		p_addr->smctp_haddr[1] = p_addr->smctp_haddr[2]; \
+		p_addr->smctp_haddr[2] = tmp;  \
 	}; 
 
 #define smctp_haddr_to_dest_phys(addr, dest) \
@@ -205,9 +206,6 @@ struct link {
 	bool prepared;
 	bool challenge;
 	sd_event_source *role_defer;
-	sd_event_source *discovery_notify_defer;
-	struct sockaddr_mctp_ext discovery_notify_addr;
-
 	struct ctx *ctx;
 };
 
@@ -291,7 +289,7 @@ struct peer {
 
 	struct {
 		sd_event_source *source;
-	} bridge_rt_poll; 
+	} bridge_rt_poll;
 };
 
 struct msg_type_support {
@@ -974,11 +972,13 @@ static void clear_interface_addrs(struct ctx *ctx, int ifindex, uint8_t* hwaddr,
 
 	// Remove all peers on this interface
 	// Iterate backwards to avoid skipping peers when array is modified by remove_peer()
+	uint32_t if_net = mctp_nl_net_byindex(ctx->nl, ifindex);
 	for (i = ctx->num_peers; i > 0; i--) {
 		struct peer *p = ctx->peers[i - 1];
 		warnx("check for Removing peer with eid %d on ifindex %d state %d",
 				p->eid, ifindex, p->state);
-		if (p->phys.ifindex != ifindex) continue;				
+		if (p->state == REMOTE && p->phys.ifindex != ifindex) continue;
+		if (p->state == LOCAL  && p->net != if_net) continue;
 		if (p->state == REMOTE) {
 			// I3C multi-bus owner isolation: Only remove peers with matching PID
 			// This prevents disrupting connections established by other bus owners
@@ -1733,63 +1733,6 @@ handle_control_resolve_endpoint_id(struct ctx *ctx, int sd,
 	return reply_message(ctx, sd, resp, resp_len, addr);
 }
 
-/* Deferred callback: send Discovery Notify to bus owner after PCIe Endpoint Discovery */
-static int on_pcie_discovery_notify_timeout(sd_event_source *s, uint64_t usec, void *userdata)
-{
-	struct link *link = userdata;
-	struct ctx *ctx = link->ctx;
-	dest_phys dest = { 0 };
-
-	sd_event_source_unref(link->discovery_notify_defer);
-	link->discovery_notify_defer = NULL;
-
-	if (link->discovered == DISCOVERY_DISCOVERED) {
-		warnx("PCIe link already discovered on ifindex %d, skip discovery notify",
-		      link->ifindex);
-		return 0;
-	}
-
-	dest.ifindex = link->ifindex;
-	dest.hwaddr_len = link->discovery_notify_addr.smctp_halen;
-	memcpy(dest.hwaddr, link->discovery_notify_addr.smctp_haddr,
-	       dest.hwaddr_len);
-
-	warnx("PCIe deferred discovery notify on ifindex %d", link->ifindex);
-
-	int rc = peer_send_discovery_notify(ctx, &dest,
-					    MCTP_CTRL_CMD_DISCOVERY_NOTIFY);
-	if (rc < 0) {
-		warnx("Failed to send deferred discovery notify: %d", rc);
-		return 0;
-	}
-
-	/* Learn bus owner as a peer */
-	struct peer *peer = find_peer_by_phys(ctx, &dest);
-	if (!peer) {
-		mctp_eid_t eid;
-		uint8_t ep_type, medium_spec;
-		uint32_t net = mctp_nl_net_byindex(ctx->nl, dest.ifindex);
-
-		rc = query_get_endpoint_id(ctx, &dest, &eid, &ep_type,
-					   &medium_spec, NULL);
-		if (rc == 0 && eid != 0) {
-			rc = add_peer(ctx, &dest, eid, net, &peer, true);
-			if (rc == 0) {
-				peer->endpoint_type = ep_type;
-				peer->medium_spec = medium_spec;
-				if (GET_MCTP_GET_EID_EP_TYPE(ep_type) ==
-				    MCTP_GET_EID_EP_TYPE_BRIDGE)
-					peer->pool_size = 1;
-				setup_added_peer(peer);
-				warnx("Learned bus owner eid %d on ifindex %d",
-				      eid, dest.ifindex);
-			}
-		}
-	}
-
-	return 0;
-}
-
 static int handle_control_prepare_endpoint_discovery(
 	struct ctx *ctx, int sd, const struct sockaddr_mctp_ext *addr,
 	const uint8_t *buf, const size_t buf_size)
@@ -1835,29 +1778,7 @@ static int handle_control_prepare_endpoint_discovery(
 	// we need to send using physical addressing, no entry in routing table yet
 	resp->completion_code = MCTP_CTRL_CC_SUCCESS;
 	PCIE_ROUTE_TO_RC_PHY_ADDRESS(addr);
-	int rc = reply_message_phys(ctx, sd, resp, sizeof(*resp), addr);
-
-	/* For PCIe binding, start a 1-second deferred work to send
-	 * Discovery Notify back to the bus owner. */
-	uint8_t phys_binding = mctp_nl_phys_binding_byindex(ctx->nl,
-							    addr->smctp_ifindex);
-	if (phys_binding == MCTP_PHYS_BINDING_PCIE_VDM) {
-		if (link_data->discovery_notify_defer) {
-			return rc;
-		}
-		memcpy(&link_data->discovery_notify_addr, addr, sizeof(*addr));
-		sd_event_add_time_relative(ctx->event,
-					   &link_data->discovery_notify_defer,
-					   CLOCK_MONOTONIC,
-					   5000000ULL, /* 5 second */
-					   0,
-					   on_pcie_discovery_notify_timeout,
-					   link_data);
-		warnx("PCIe endpoint discovery: scheduled discovery notify in 1s on ifindex %d",
-		      addr->smctp_ifindex);
-	}
-
-	return rc;
+	return reply_message_phys(ctx, sd, resp, sizeof(*resp), addr);
 }
 
 static int
