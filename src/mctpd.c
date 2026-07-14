@@ -3209,8 +3209,9 @@ int mctp_setup_routing_entry(struct peer *peer, struct get_routing_table_entry *
 		dest.hwaddr[1] = phys_address[0]; /* BDF low byte */
 		dest.hwaddr[2] = phys_address[1]; /* BDF high byte */
 		dest.hwaddr_len = 3;
-		warnx("%s: PCIe VDM address setup - Route type: %d, BDF: 0x%02x%02x\n", 
-				__func__, dest.hwaddr[0], dest.hwaddr[2], dest.hwaddr[1]);
+		if (peer->ctx->verbose)
+			warnx("%s: PCIe VDM address setup - Route type: %d, BDF: 0x%02x%02x\n", 
+					__func__, dest.hwaddr[0], dest.hwaddr[2], dest.hwaddr[1]);
 		
 	} else if ((routing_table_entry->phys_transport_binding_id == MCTP_BINDING_VDM && 
 		routing_table_entry->phys_address_size == 2) || 
@@ -3239,8 +3240,9 @@ int mctp_setup_routing_entry(struct peer *peer, struct get_routing_table_entry *
 	// Skip setup for peers that already existed and were previously discovered
 	// to avoid redundant discovery commands (Get Message Type, Get Endpoint UUID, etc.)
 	if (ret_peer) {
-		warnx("%s: Skipping rediscovery for existing peer EID %d (already discovered)\n",
-				__func__, routing_table_entry->starting_eid);
+		if (peer->ctx->verbose)
+			warnx("%s: Skipping rediscovery for existing peer EID %d (already discovered)\n",
+					__func__, routing_table_entry->starting_eid);
 		if (GET_ROUTING_ENTRY_TYPE(routing_table_entry->entry_type) == MCTP_ROUTING_ENTRY_BRIDGE_AND_ENDPOINTS) {
 			ret_peer->pool_size = routing_table_entry->eid_range_size;
 			ret_peer->pool_start = routing_table_entry->starting_eid;
@@ -3285,8 +3287,9 @@ int mctp_setup_routing_entry(struct peer *peer, struct get_routing_table_entry *
 	}
 	rc = setup_added_peer(ret_peer);
 
-	warnx("%s: Kernel routing setup completed for EID %d, result: %d\n", 
-			__func__, routing_table_entry->starting_eid, rc);
+	if (peer->ctx->verbose)
+		warnx("%s: Kernel routing setup completed for EID %d, result: %d\n", 
+				__func__, routing_table_entry->starting_eid, rc);
 
 	return rc;
 }
@@ -3325,9 +3328,10 @@ int mctp_get_routing_table_get_response(struct peer *peer, struct mctp_ctrl_resp
 {
 	uint8_t g_pci_own_eid = local_addr(peer->ctx, peer->phys.ifindex);
 
-	warnx("%s: Next entry handle: %d, Number of entries: %d\n",
-			__func__, routing_table->next_entry_handle,
-			routing_table->number_of_entries);
+	if (peer->ctx->verbose)
+		warnx("%s: Next entry handle: %d, Number of entries: %d\n",
+				__func__, routing_table->next_entry_handle,
+				routing_table->number_of_entries);
 
 	*entry_hdl = routing_table->next_entry_handle;
 
@@ -3349,13 +3353,15 @@ int mctp_get_routing_table_get_response(struct peer *peer, struct mctp_ctrl_resp
 
 			/* Dont add the entry to the routing table if the EID is it's own */
 			if (routing_table_entry->starting_eid == g_pci_own_eid) {
-				warnx(
-					"%s: Found it's own eid: [%d] in the Routing table\n",
-					__func__, routing_table_entry->starting_eid);
+				if (peer->ctx->verbose)
+					warnx(
+						"%s: Found it's own eid: [%d] in the Routing table\n",
+						__func__, routing_table_entry->starting_eid);
 			} else if (is_local_eid(peer->ctx, routing_table_entry->starting_eid, peer->net)) {
-				warnx(
-					"%s: Found local eid: [%d] in the Routing table, skipping\n",
-					__func__, routing_table_entry->starting_eid);
+				if (peer->ctx->verbose)
+					warnx(
+						"%s: Found local eid: [%d] in the Routing table, skipping\n",
+						__func__, routing_table_entry->starting_eid);
 			} else {
 				/* Check transport binding id and filter out the unknown binding */
 				uint8_t phys_binding = mctp_nl_phys_binding_byindex(peer->ctx->nl, peer->phys.ifindex);	
@@ -3368,11 +3374,13 @@ int mctp_get_routing_table_get_response(struct peer *peer, struct mctp_ctrl_resp
 					/* Setup kernel-specific routing operations only for bridge entries */
 					/* Check if entry type indicates a bridge (bits [7:6] = 10b or 11b) */
 					if (GET_ROUTING_ENTRY_TYPE(routing_table_entry->entry_type) == MCTP_ROUTING_ENTRY_ENDPOINTS) {
-						warnx("%s: Bridge entry detected (entry_type=0x%02x), setting up kernel routing for EID %d\n",
-								__func__, routing_table_entry->entry_type, routing_table_entry->starting_eid);
+						if (peer->ctx->verbose)
+							warnx("%s: Bridge entry detected (entry_type=0x%02x), setting up kernel routing for EID %d\n",
+									__func__, routing_table_entry->entry_type, routing_table_entry->starting_eid);
 					} else {
-						warnx("%s: Non-bridge entry (entry_type=0x%02x), skipping kernel routing setup for EID %d\n",
-								__func__, routing_table_entry->entry_type, routing_table_entry->starting_eid);
+						if (peer->ctx->verbose)
+							warnx("%s: Non-bridge entry (entry_type=0x%02x), skipping kernel routing setup for EID %d\n",
+									__func__, routing_table_entry->entry_type, routing_table_entry->starting_eid);
 						if (mctp_setup_routing_entry(peer, routing_table_entry, next_routing_table_entry) < 0) {
 							warnx(
 								"%s: Failed to setup kernel routing entry for bridge EID %d\n",
@@ -3392,10 +3400,11 @@ int mctp_get_routing_table_get_response(struct peer *peer, struct mctp_ctrl_resp
 					}
 
 				} else {
-					warnx(
-						"%s: EID: 0x%x: No valid medium type %x\n",
-						__func__,
-						routing_table_entry->starting_eid, routing_table_entry->phys_transport_binding_id);
+					if (peer->ctx->verbose)
+						warnx(
+							"%s: EID: 0x%x: No valid medium type %x\n",
+							__func__,
+							routing_table_entry->starting_eid, routing_table_entry->phys_transport_binding_id);
 				}
 			}
 		}
@@ -3405,14 +3414,16 @@ int mctp_get_routing_table_get_response(struct peer *peer, struct mctp_ctrl_resp
 		/* Check if the next routing table exist.. */
 		if (routing_table->next_entry_handle != 0xFF) {
 			
-			warnx("%s: Next routing entry found %d\n",
-					__func__,
-					routing_table->next_entry_handle);
+			if (peer->ctx->verbose)
+				warnx("%s: Next routing entry found %d\n",
+						__func__,
+						routing_table->next_entry_handle);
 			return 1;
 		} else {			
-			warnx("%s: No more routing entries %d\n",
-					__func__,
-					routing_table->next_entry_handle);
+			if (peer->ctx->verbose)
+				warnx("%s: No more routing entries %d\n",
+						__func__,
+						routing_table->next_entry_handle);
 		}
 	}
 
