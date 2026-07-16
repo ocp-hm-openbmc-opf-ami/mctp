@@ -103,19 +103,13 @@ enum mctp_astpcie_msg_routing {
 #define PCIE_ROUTE_BY_ID_PHY_ADDRESS(addr) \
 	if ((addr)->smctp_halen == 3) { \
 		struct sockaddr_mctp_ext * p_addr = (struct sockaddr_mctp_ext *) (addr); \
-		uint8_t tmp = p_addr->smctp_haddr[1]; \
 		p_addr->smctp_haddr[0] = PCIE_ROUTE_BY_ID; \
-		p_addr->smctp_haddr[1] = p_addr->smctp_haddr[2]; \
-		p_addr->smctp_haddr[2] = tmp;  \
-	}; 
+	};
 
 #define PCIE_ROUTE_TO_RC_PHY_ADDRESS(addr) \
 	if ((addr)->smctp_halen == 3) { \
 		struct sockaddr_mctp_ext * p_addr = (struct sockaddr_mctp_ext *) (addr); \
-		uint8_t tmp = p_addr->smctp_haddr[1]; \
 		p_addr->smctp_haddr[0] = PCIE_ROUTE_TO_RC; \
-		p_addr->smctp_haddr[1] = p_addr->smctp_haddr[2]; \
-		p_addr->smctp_haddr[2] = tmp;  \
 	}; 
 
 #define smctp_haddr_to_dest_phys(addr, dest) \
@@ -3206,8 +3200,8 @@ int mctp_setup_routing_entry(struct peer *peer, struct get_routing_table_entry *
 		/* PCIe VDM requires 3 bytes: route_type + BDF */
 		/* Set route type based on command type */
 		dest.hwaddr[0] = PCIE_ROUTE_BY_ID; /* Route type = 2 (routed to ID) */
-		dest.hwaddr[1] = phys_address[0]; /* BDF low byte */
-		dest.hwaddr[2] = phys_address[1]; /* BDF high byte */
+		dest.hwaddr[1] = phys_address[0]; /* BDF high byte (bus, BE in routing table) */
+		dest.hwaddr[2] = phys_address[1]; /* BDF low byte (dev_func) */
 		dest.hwaddr_len = 3;
 		if (peer->ctx->verbose)
 			warnx("%s: PCIe VDM address setup - Route type: %d, BDF: 0x%02x%02x\n", 
