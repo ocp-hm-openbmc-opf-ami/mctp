@@ -3217,6 +3217,12 @@ int mctp_setup_routing_entry(struct peer *peer, struct get_routing_table_entry *
 		warnx("%s: Using physical address directly - binding: %d, size: %d\n", 
 				__func__, routing_table_entry->phys_transport_binding_id, 
 				routing_table_entry->phys_address_size);
+		if (routing_table_entry->phys_address_size > MAX_ADDR_LEN) {
+			warnx("%s: phys_address_size %u exceeds MAX_ADDR_LEN %d",
+			      __func__, routing_table_entry->phys_address_size,
+			      MAX_ADDR_LEN);
+			return -EINVAL;
+		}
  	    dest.hwaddr_len = routing_table_entry->phys_address_size;
 		if (routing_table_entry->phys_address_size > 0) {
 			memcpy(dest.hwaddr, phys_address, 
