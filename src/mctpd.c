@@ -2331,13 +2331,15 @@ static int endpoint_query_addr(struct ctx *ctx,
 		      ext_addr_tostr(req_addr));
 		rc = -ENOMSG;
 		free(buf);
+		buf = NULL;
+		goto out;
 	}
 
 	rc = 0;
 out:
 	close(sd);
 	if (rc != 0) {
-		//free(buf);
+		free(buf);
 	} else {
 		*resp = buf;
 		*resp_len = buf_size;
