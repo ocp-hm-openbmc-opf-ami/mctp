@@ -3266,6 +3266,24 @@ int mctp_setup_routing_entry(struct peer *peer, struct get_routing_table_entry *
 					CC_MCTP_DBUS_IFACE_BRIDGE, ret_peer->eid, strerror(-rc));
 			}
 		}
+
+		/* Re-query properties for peers that were published without message
+		 * types (e.g. device did not respond to Get Message Type during
+		 * initial discovery but may be ready now). */
+		if (ret_peer->num_message_types == 0 && ret_peer->published) {
+			warnx("%s: peer EID %d has no message types, retrying query",
+			      __func__, ret_peer->eid);
+			rc = query_peer_properties(ret_peer);
+			if (rc == 0 && ret_peer->num_message_types > 0) {
+				unpublish_peer(ret_peer);
+				add_peer_route(ret_peer);
+				rc = publish_peer(ret_peer);
+				if (rc < 0)
+					warnx("%s: failed to republish peer EID %d after msg type update: %s",
+					      __func__, ret_peer->eid, strerror(-rc));
+			}
+		}
+
 		return 0;  // Success, but skip setup
 	}
 
