@@ -14,6 +14,34 @@ cc = meson.get_compiler('c')
 
 add_project_arguments('-Wno-unused-parameter', language : 'c')
 
+# Test-only setup: It relaxes warning checks and install test dependencies.
+if get_option('tests')
+    add_project_arguments(
+           '-Wno-error',
+           '-Wno-pointer-arith',
+           '-Wno-format',
+           '-Wno-pedantic',
+           language: ['cpp','c'])
+
+    pip3 = find_program('pip3', required: true)
+    run_command(
+        pip3, 'install',
+        '--break-system-packages',
+        '--root-user-action=ignore',
+        '--quiet',
+        '-r', join_paths(meson.current_source_dir(), 'tests', 'requirements.txt'),
+        check: true,
+    )
+
+    # Add common user/system bin paths so pytest can be found.
+    python3_prog = find_program('python3', required: true)
+    user_base = run_command(
+        python3_prog, '-c', 'import site; print(site.USER_BASE)',
+        check: true,
+    ).stdout().strip()
+    pytest_search_dirs = [join_paths(user_base, 'bin'), '/usr/local/bin', '/usr/bin']
+endif
+
 libsystemd = dependency('libsystemd', version: '>=247', required: false)
 
 conf = configuration_data()
@@ -211,7 +239,7 @@ if tests
     test_dir = join_paths(meson.current_source_dir(), 'tests')
     pytest_conf = join_paths(test_dir, 'pytest.ini')
 
-    pytest = find_program('pytest')
+    pytest = find_program('pytest', dirs: pytest_search_dirs)
     script = 'if [ ! -t 1 ]; then PFL="--tap"; fi; DBUS_STARTER_BUS_TYPE=user "@0@" $PFL --config-file "@1@" $@'.format(
       pytest.full_path(),
       pytest_conf,
