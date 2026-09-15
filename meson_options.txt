@@ -1,4 +1,6 @@
 option('unsafe-recover-nil-uuid', type: 'boolean', value: false)
+option('nuvoton-sdk', type: 'boolean', value: false,
+       description: 'Enable Nuvoton SDK support')
 option('unsafe-writable-connectivity',
        type: 'boolean',
        value: false,
