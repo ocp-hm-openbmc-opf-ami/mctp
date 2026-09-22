@@ -46,6 +46,7 @@
 #include <sys/ioctl.h>
 #include "mctp-oem-extensions.h"
 #include "mctp-pid.h"
+#include "mctp-config.h"
 
 #define max(a, b) ((a) > (b) ? (a) : (b))
 #define min(a, b) ((a) < (b) ? (a) : (b))
@@ -352,8 +353,8 @@ struct ctx {
 	//  maximum pool size for assumed MCTP Bridge
 	uint8_t max_pool_size;
 
-	enum endpoint_role  pcie_role;
 	struct i3c_config i3c_config;
+	struct pcie_config pcie_config;
 
 	// bus owner/bridge polling interval in usecs for
 	// checking endpoint's accessibility.
@@ -392,7 +393,6 @@ static void del_net(struct net *net);
 static int add_interface(struct ctx *ctx, int ifindex);
 static int endpoint_allocate_eids(struct peer *peer);
 
-static int query_get_peer_routing_table(struct peer *peer);
 static int bridge_setup_endpoint(struct ctx *ctx, dest_phys *dest, mctp_eid_t eid);
 static int peer_send_routing_information_update(struct ctx *ctx, struct peer *peer, struct peer *new_peer);
 static int peer_send_discovery_notify(struct ctx *ctx, dest_phys *dest, uint8_t command);
@@ -401,6 +401,8 @@ static int query_get_endpoint_id(struct ctx *ctx, const dest_phys *dest,
 				 uint8_t *ret_medium_spec, struct peer *peer);
 static int on_get_routing_table_timer_start(sd_event_source *s, uint64_t usec, void *userdata);
 static int on_get_routing_table_start(sd_event_source *s, void *userdata);
+static int defer_query_routing_table_by_page(struct peer *peer);
+static int on_routing_table_page_query(sd_event_source *s, void *userdata);
 static int on_i2c_smbus_find_location(sd_event_source *s, void *userdata);
 static int do_endpoint_discovery_work(struct link *link, dest_phys *dest);
 static int i2c_smbus_find_location(int bus_num, char *parent_path, char *parent_name,
@@ -549,6 +551,37 @@ static bool is_local_eid(const struct ctx *ctx, mctp_eid_t eid, uint32_t net)
 }
 
 static void *dfree(void *ptr);
+
+#ifdef MCTP_I3C_MULTIPLE_BO_WITH_DIFF_EIDS
+/* Return the ifindex that owns a local EID on a given network, or -1. */
+static int find_local_eid_ifindex(const struct ctx *ctx, mctp_eid_t eid,
+				  uint32_t net)
+{
+	size_t num_ifs;
+	int *ifs = mctp_nl_if_list(ctx->nl, &num_ifs);
+	if (!ifs)
+		return -1;
+	for (size_t i = 0; i < num_ifs; i++) {
+		if (mctp_nl_net_byindex(ctx->nl, ifs[i]) != net)
+			continue;
+		size_t n;
+		mctp_eid_t *eids = mctp_nl_addrs_byindex(ctx->nl, ifs[i], &n);
+		if (!eids)
+			continue;
+		for (size_t j = 0; j < n; j++) {
+			if (eids[j] == eid) {
+				int ret = ifs[i];
+				free(eids);
+				free(ifs);
+				return ret;
+			}
+		}
+		free(eids);
+	}
+	free(ifs);
+	return -1;
+}
+#endif
 
 static struct net *lookup_net(struct ctx *ctx, uint32_t net)
 {
@@ -945,6 +978,7 @@ static void clear_interface_addrs(struct ctx *ctx, int ifindex, uint8_t* hwaddr,
 	// Multi-bus owner I3C support: Lookup EID assigned by the specific bus owner
 	// For I3C interfaces, use PID-to-EID mapping to identify which EID to clear
 	// Remove all addresses on this interface
+#ifdef MCTP_I3C_MULTIPLE_BO_WITH_DIFF_EIDS
 	uint8_t phys_binding = mctp_nl_phys_binding_byindex(ctx->nl, ifindex);
 	if (phys_binding == MCTP_PHYS_BINDING_I3C && hwaddr_len == MCTP_I3C_PHYS_ADDR_LEN) {
 		warnx("I3C interface ifindex %d with PID 0x%02x%02x%02x%02x%02x%02x detected, looking up EID to clear",
@@ -963,16 +997,15 @@ static void clear_interface_addrs(struct ctx *ctx, int ifindex, uint8_t* hwaddr,
 			pid_del_mapping(&ctx->i3c_config, old_eid);
 		}
 	}
+#endif
 
 	// Remove all peers on this interface
 	// Iterate backwards to avoid skipping peers when array is modified by remove_peer()
-	uint32_t if_net = mctp_nl_net_byindex(ctx->nl, ifindex);
 	for (i = ctx->num_peers; i > 0; i--) {
 		struct peer *p = ctx->peers[i - 1];
 		warnx("check for Removing peer with eid %d on ifindex %d state %d",
 				p->eid, ifindex, p->state);
-		if (p->state == REMOTE && p->phys.ifindex != ifindex) continue;
-		if (p->state == LOCAL  && p->net != if_net) continue;
+		if (p->phys.ifindex != ifindex) continue;
 		if (p->state == REMOTE) {
 			// I3C multi-bus owner isolation: Only remove peers with matching PID
 			// This prevents disrupting connections established by other bus owners
@@ -986,7 +1019,11 @@ static void clear_interface_addrs(struct ctx *ctx, int ifindex, uint8_t* hwaddr,
 					p->eid, ifindex);
 			remove_peer(p);
 		} else {
+#ifdef	MCTP_I3C_MULTIPLE_BO_WITH_DIFF_EIDS
 			if (phys_binding != MCTP_PHYS_BINDING_I3C && req_eid != local_addr(ctx, ifindex)) {
+#else
+			if ( req_eid != local_addr(ctx, ifindex)) {
+#endif
 				rc = mctp_nl_addr_del(ctx->nl, p->eid,
 						      ifindex);
 				if (rc < 0) {
@@ -1112,15 +1149,16 @@ static int handle_control_set_endpoint_id(struct ctx *ctx, int sd,
 			link_data->discovered = DISCOVERY_DISCOVERED;
 		}
 
+#ifdef MCTP_I3C_MULTIPLE_BO_WITH_DIFF_EIDS
 		uint8_t phys_binding = mctp_nl_phys_binding_byindex(ctx->nl, addr->smctp_ifindex);
-		const char * if_name = mctp_nl_if_byindex(ctx->nl, addr->smctp_ifindex);	
-		if (phys_binding == MCTP_PHYS_BINDING_I3C && is_primary_busowner_addr(&ctx->i3c_config, addr->smctp_haddr)) {
+		const char * if_name = mctp_nl_if_byindex(ctx->nl, addr->smctp_ifindex);
+		if (phys_binding == MCTP_PHYS_BINDING_I3C && i3c_is_primary_busowner_addr(&ctx->i3c_config, addr->smctp_haddr)) {
 			resp->status =
 				SET_MCTP_EID_ASSIGNMENT_STATUS(MCTP_SET_EID_ACCEPTED) |
 				SET_MCTP_EID_ALLOCATION_STATUS(MCTP_SET_EID_POOL_REQUIRED);
 			resp->eid_set = req->eid;
 			resp->eid_pool_size = 2;
-		} else if (phys_binding == MCTP_PHYS_BINDING_I3C && is_secondary_busowner_addr(&ctx->i3c_config, addr->smctp_haddr)) {
+		} else if (phys_binding == MCTP_PHYS_BINDING_I3C && i3c_is_secondary_busowner_addr(&ctx->i3c_config, addr->smctp_haddr)) {
 			resp->status =
 				SET_MCTP_EID_ASSIGNMENT_STATUS(MCTP_SET_EID_ACCEPTED) |
 				SET_MCTP_EID_ALLOCATION_STATUS(MCTP_SET_EID_POOL_NONE);
@@ -1133,6 +1171,15 @@ static int handle_control_set_endpoint_id(struct ctx *ctx, int sd,
 			resp->eid_set = req->eid;
 			resp->eid_pool_size = 0;
 		}
+#else
+		{
+			resp->status =
+				SET_MCTP_EID_ASSIGNMENT_STATUS(MCTP_SET_EID_ACCEPTED) |
+				SET_MCTP_EID_ALLOCATION_STATUS(MCTP_SET_EID_POOL_NONE);
+			resp->eid_set = req->eid;
+			resp->eid_pool_size = 0;
+		}
+#endif
 		fprintf(stderr, "Accepted set eid %d\n", req->eid);
 
 		PCIE_ROUTE_BY_ID_PHY_ADDRESS(addr);
@@ -1147,10 +1194,12 @@ static int handle_control_set_endpoint_id(struct ctx *ctx, int sd,
 			warnx("ERR: cannot add bus owner to object lists");
 		}
 
-		if (is_busowner_interface(&ctx->i3c_config, if_name)) {
+#ifdef MCTP_I3C_MULTIPLE_BO_WITH_DIFF_EIDS
+		if (i3c_is_busowner_interface(&ctx->i3c_config, if_name)) {
 			pid_add_mapping(&ctx->i3c_config, req->eid, peer->phys.hwaddr);
 			pid_display_mappings();
 		}
+#endif
 		return reply_message(ctx, sd, resp, resp_len, addr);
 
 #if 0
@@ -1231,7 +1280,7 @@ static int handle_control_allocate_endpoint_ids(struct ctx *ctx, int sd,
 			//loop through all endpoints and assign eids
 			for (int i = 0; i < ctx->i3c_config.num_devices; i++) {
 				struct i3c_device *dev = &ctx->i3c_config.devices[i];
-				if (strcmp(dev->role, "endpoint") == 0)
+				if (strcmp(dev->role, "bus-owner") == 0)
 				{
 					int endpoint_ifindex =
 						mctp_nl_ifindex_byname(
@@ -1497,6 +1546,7 @@ static int handle_control_get_endpoint_id(struct ctx *ctx, int sd,
 	// Default EID - will be overridden if PID mapping exists
 	resp->eid = local_addr(ctx, addr->smctp_ifindex);
 
+#ifdef MCTP_I3C_MULTIPLE_BO_WITH_DIFF_EIDS
 	// Standalone PID-based EID response for multi-bus owner support
 	if (addr->smctp_halen == MCTP_I3C_PHYS_ADDR_LEN) {
 		mctp_eid_t mapped_eid = pid_lookup_eid(&ctx->i3c_config, addr->smctp_haddr);
@@ -1510,11 +1560,12 @@ static int handle_control_get_endpoint_id(struct ctx *ctx, int sd,
 				      addr->smctp_haddr[3], addr->smctp_haddr[4], addr->smctp_haddr[5],
 				      mapped_eid);
 			}
-		} else if (is_secondary_busowner_addr(&ctx->i3c_config, addr->smctp_haddr)) {
+		} else if (i3c_is_secondary_busowner_addr(&ctx->i3c_config, addr->smctp_haddr)) {
 				  warnx("Get EID: No PID mapping, using Zero EID %d \n",resp->eid);
 				  resp->eid = 0;
 		}
 	}
+#endif
 
 	resp->eid_type = 0;
 
@@ -1535,7 +1586,7 @@ static int handle_control_get_endpoint_id(struct ctx *ctx, int sd,
 		resp->eid_type |=
 			SET_ENDPOINT_ID_TYPE(MCTP_DYNAMIC_EID);
 
-		if (is_primary_busowner_addr(&ctx->i3c_config, addr->smctp_haddr)) {
+		if (i3c_is_primary_busowner_addr(&ctx->i3c_config, addr->smctp_haddr)) {
 			resp->eid_type |= SET_ENDPOINT_TYPE(MCTP_BUS_OWNER_BRIDGE);
 			resp->eid_type |= SET_ENDPOINT_ID_TYPE(MCTP_DYNAMIC_EID);
 		}
@@ -2100,7 +2151,7 @@ static int listen_monitor(struct ctx *ctx)
 	}
 		
 	if (g_OEMMCTPHndlr[ON_I2C_INIT] != NULL) {
-		int rc = g_OEMMCTPHndlr[ON_I2C_INIT]((void *)sd, (void *)NULL);
+		int rc = g_OEMMCTPHndlr[ON_I2C_INIT]((void *)(intptr_t)sd, (void *)NULL);
 		if (rc < 0)
 			warnx("Failed to onI2CInit \n");
 	}
@@ -2424,7 +2475,8 @@ static int endpoint_query_phys(struct ctx *ctx, const dest_phys *dest,
  */
 static int endpoint_send_set_endpoint_id(const struct peer *peer,
 					 mctp_eid_t *new_eidp,
-					 uint8_t *req_pool_size)
+					 uint8_t *req_pool_size,
+					 bool force)
 {
 	struct sockaddr_mctp_ext addr;
 	struct mctp_ctrl_cmd_set_eid req = { 0 };
@@ -2443,8 +2495,8 @@ static int endpoint_send_set_endpoint_id(const struct peer *peer,
 	mctp_ctrl_msg_hdr_init_req(&req.ctrl_hdr, iid,
 				   MCTP_CTRL_CMD_SET_ENDPOINT_ID);
 
-	req.operation =
-		mctp_ctrl_cmd_set_eid_set_eid; // TODO: do we want Force?
+	req.operation = force ? mctp_ctrl_cmd_set_eid_force_eid
+			      : mctp_ctrl_cmd_set_eid_set_eid;
 	req.eid = peer->eid;
 	
 	for (int retry = 0; retry < 3; retry ++) {
@@ -2967,7 +3019,8 @@ static int endpoint_assign_eid(struct ctx *ctx, sd_bus_error *berr,
 	 * it should be routable. */
 	add_peer_route(peer);
 
-	rc = endpoint_send_set_endpoint_id(peer, &new_eid, &req_pool_size);
+	rc = endpoint_send_set_endpoint_id(peer, &new_eid, &req_pool_size,
+					   static_eid != 0);
 	if (rc == -ECONNREFUSED)
 		sd_bus_error_setf(
 			berr, SD_BUS_ERROR_FAILED,
@@ -3216,19 +3269,24 @@ int mctp_setup_routing_entry(struct peer *peer, struct get_routing_table_entry *
 			memcpy(dest.hwaddr, peer->phys.hwaddr, peer->phys.hwaddr_len);
 		dest.hwaddr_len = peer->phys.hwaddr_len;
 	} else {
-		warnx("%s: Using physical address directly - binding: %d, size: %d\n", 
-				__func__, routing_table_entry->phys_transport_binding_id, 
-				routing_table_entry->phys_address_size);
 		if (routing_table_entry->phys_address_size > MAX_ADDR_LEN) {
 			warnx("%s: phys_address_size %u exceeds MAX_ADDR_LEN %d",
 			      __func__, routing_table_entry->phys_address_size,
 			      MAX_ADDR_LEN);
 			return -EINVAL;
 		}
- 	    dest.hwaddr_len = routing_table_entry->phys_address_size;
-		if (routing_table_entry->phys_address_size > 0) {
-			memcpy(dest.hwaddr, phys_address, 
-						   routing_table_entry->phys_address_size);
+		dest.hwaddr_len = routing_table_entry->phys_address_size;
+		if (routing_table_entry->phys_address_size == 3 &&
+		    peer->phys.hwaddr_len == 3) {
+			dest.hwaddr[0] = PCIE_ROUTE_BY_ID;       /* route_type: BY_ID or BROADCAST */
+			dest.hwaddr[1] = phys_address[1];   /* bridge BDF_hi */
+			dest.hwaddr[2] = phys_address[2];   /* bridge BDF_lo */
+			warnx("%s: bridged endpoint EID %d: route 0x%02x via bridge BDF 0x%02x%02x\n",
+				__func__, routing_table_entry->starting_eid,
+				dest.hwaddr[0], dest.hwaddr[1], dest.hwaddr[2]);
+		} else if (routing_table_entry->phys_address_size > 0) {
+			memcpy(dest.hwaddr, phys_address,
+			       routing_table_entry->phys_address_size);
 		}
 	}
 
@@ -3406,17 +3464,6 @@ int mctp_get_routing_table_get_response(struct peer *peer, struct mctp_ctrl_resp
 								"%s: Failed to setup kernel routing entry for bridge EID %d\n",
 								__func__, routing_table_entry->starting_eid);
 						}
-						while (sd_bus_process(peer->ctx->bus, NULL))
-							;
-						struct net *n = lookup_net(peer->ctx, peer->net);
-						if (!n) {
-							bug_warn("%s: Bad net %u", __func__, peer->net);
-							return -EPROTO;
-						}							
-						if (check_peer_struct(peer, n) != 0) {
-							bug_warn("%s: Inconsistent state", __func__);
-							return -EPROTO;
-						}
 					}
 
 				} else {
@@ -3448,69 +3495,6 @@ int mctp_get_routing_table_get_response(struct peer *peer, struct mctp_ctrl_resp
 	}
 
 	return 0;
-}
-
-static int query_get_peer_routing_table(struct peer *peer) 
-{
-	struct sockaddr_mctp_ext addr;
-	struct mctp_ctrl_cmd_get_routing_table req;
-	struct mctp_ctrl_resp_get_routing_table *resp = NULL;
-	uint8_t* buf = NULL;
-	size_t buf_size;
-	int rc;
-	uint8_t entry_handle = 0x00;
-
-	while (1) {
-		/* Process pending high-priority events (like control messages) before each query */
-		while (sd_bus_process(peer->ctx->bus, NULL))
-			;
-		struct net *n = lookup_net(peer->ctx, peer->net);
-		if (!n) {
-			bug_warn("%s: Bad net %u", __func__, peer->net);
-			return -EPROTO;
-		}		
-		if (check_peer_struct(peer, n) != 0) {
-			bug_warn("%s: Inconsistent state", __func__);
-			return -EPROTO;
-		}		
-		uint8_t iid = mctp_next_iid(peer->ctx);
-		mctp_ctrl_msg_hdr_init_req(&req.ctrl_hdr, iid,
-			MCTP_CTRL_CMD_GET_ROUTING_TABLE_ENTRIES);		
-
-		req.entry_handle = entry_handle;
-
-		rc = endpoint_query_peer(peer, MCTP_CTRL_HDR_MSG_TYPE,
-			&req, sizeof(req), &buf, &buf_size, &addr);
-		if (rc < 0)
-			return rc;
-
-
-		if (buf_size < sizeof(*resp)) {
-			warnx("%s: short reply %zu bytes. dest %s", __func__, buf_size,
-				peer_tostr(peer));
-			rc = -ENOMSG;
-			goto out;
-		}
-		resp = (void *)buf;
-
-		rc = mctp_ctrl_validate_response(
-			buf, buf_size, sizeof(*resp), peer_tostr_short(peer), iid,
-			MCTP_CTRL_CMD_GET_ROUTING_TABLE_ENTRIES);
-		if (rc)
-			goto out;
-
-		rc = mctp_get_routing_table_get_response(peer, resp, &entry_handle);
-
-		if (rc != 1)
-			break;
-
-		free(buf);
-	}
-
-	rc = 0;
-out:
-	free(buf);
-	return rc;
 }
 
 static int peer_send_routing_information_update(struct ctx *ctx, struct peer *peer, struct peer* new_peer)
@@ -3951,8 +3935,9 @@ static int on_get_routing_table_start(sd_event_source *s, void *userdata)
 	if (check_peer_struct(peer, n) != 0) {
 		rc = -EPROTO;
 		goto release;
-	}	
-	rc = query_get_peer_routing_table(peer);
+	}
+	/* Use the non-blocking, page-by-page query chain. */
+	rc = defer_query_routing_table_by_page(peer);
 	peer->bridge_rt_poll.source = NULL;
 
 release:
@@ -3965,6 +3950,134 @@ static int on_get_routing_table_timer_start(sd_event_source *s, uint64_t usec,
 					    void *userdata)
 {
 	return on_get_routing_table_start(s, userdata);
+}
+
+/* ---- Deferred page-by-page routing table query --------------------------
+ *
+ * Each invocation fetches one page (entry_handle) of the routing table for
+ * a single peer, then re-schedules itself as a new defer if more pages
+ * remain.  This keeps individual event-loop iterations short and avoids
+ * blocking the bus while walking multi-page routing tables.
+ *
+ * Context struct is heap-allocated and freed when the chain completes or
+ * an error is encountered.
+ */
+struct rt_page_ctx {
+	struct peer  *peer;
+	uint32_t      net;          /* net at enqueue time, for safety checks */
+	mctp_eid_t    eid;          /* peer EID at enqueue time */
+	uint8_t       entry_handle; /* current page (0x00 = first page) */
+};
+
+static int on_routing_table_page_query(sd_event_source *s, void *userdata)
+{
+	struct rt_page_ctx *rctx = userdata;
+	struct peer *peer = rctx->peer;
+	struct ctx  *ctx  = peer->ctx;
+
+	sd_event_source_unref(s);
+
+	/* Validate peer is still alive and consistent */
+	struct net *n = lookup_net(ctx, rctx->net);
+	if (!n) {
+		warnx("%s: net %u gone, aborting routing table query for EID %u",
+		      __func__, rctx->net, rctx->eid);
+		free(rctx);
+		return 0;
+	}
+	if (peer->net != rctx->net || peer->eid != rctx->eid ||
+	    check_peer_struct(peer, n) != 0) {
+		warnx("%s: peer net=%u eid=%u no longer matches context, aborting",
+		      __func__, rctx->net, rctx->eid);
+		free(rctx);
+		return 0;
+	}
+
+	/* Build and send one Get Routing Table Entries request */
+	struct mctp_ctrl_cmd_get_routing_table req;
+	struct mctp_ctrl_resp_get_routing_table *resp = NULL;
+	struct sockaddr_mctp_ext addr;
+	uint8_t *buf  = NULL;
+	size_t   buf_size;
+	uint8_t  iid  = mctp_next_iid(ctx);
+
+	mctp_ctrl_msg_hdr_init_req(&req.ctrl_hdr, iid,
+				   MCTP_CTRL_CMD_GET_ROUTING_TABLE_ENTRIES);
+	req.entry_handle = rctx->entry_handle;
+
+	int rc = endpoint_query_peer(peer, MCTP_CTRL_HDR_MSG_TYPE,
+				     &req, sizeof(req), &buf, &buf_size, &addr);
+	if (rc < 0) {
+		warnx("%s: query page 0x%02x for net=%u eid=%u failed: %s",
+		      __func__, rctx->entry_handle, rctx->net, rctx->eid,
+		      strerror(-rc));
+		free(rctx);
+		return rc;
+	}
+
+	if (buf_size < sizeof(*resp)) {
+		warnx("%s: short reply %zu bytes for net=%u eid=%u page=0x%02x",
+		      __func__, buf_size, rctx->net, rctx->eid,
+		      rctx->entry_handle);
+		free(buf);
+		free(rctx);
+		return -ENOMSG;
+	}
+	resp = (void *)buf;
+
+	rc = mctp_ctrl_validate_response(buf, buf_size, sizeof(*resp),
+					 peer_tostr_short(peer), iid,
+					 MCTP_CTRL_CMD_GET_ROUTING_TABLE_ENTRIES);
+	if (rc == 0)
+		rc = mctp_get_routing_table_get_response(peer, resp,
+						     &rctx->entry_handle);
+	free(buf);
+
+	if (rc == 1) {
+		/* More pages remain: schedule the next page as a new defer */
+		int sched_rc = sd_event_add_defer(ctx->event, NULL,
+						  on_routing_table_page_query,
+						  rctx);
+		if (sched_rc < 0) {
+			warnx("%s: failed to re-schedule page query: %s",
+			      __func__, strerror(-sched_rc));
+			free(rctx);
+		}
+	} else {
+		/* Done (rc == 0) or error (rc < 0) */
+		if (rc < 0)
+			warnx("%s: routing table page error for net=%u eid=%u: %s",
+			      __func__, rctx->net, rctx->eid, strerror(-rc));
+		free(rctx);
+	}
+
+	return 0;
+}
+
+/**
+ * defer_query_routing_table_by_page - schedule a non-blocking, page-by-page
+ * routing table query for @peer.  Returns 0 on success, negative on failure
+ * to allocate or schedule the first defer event.
+ */
+static int defer_query_routing_table_by_page(struct peer *peer)
+{
+	struct rt_page_ctx *rctx = calloc(1, sizeof(*rctx));
+	if (!rctx)
+		return -ENOMEM;
+
+	rctx->peer         = peer;
+	rctx->net          = peer->net;
+	rctx->eid          = peer->eid;
+	rctx->entry_handle = 0x00;
+
+	int rc = sd_event_add_defer(peer->ctx->event, NULL,
+				    on_routing_table_page_query, rctx);
+	if (rc < 0) {
+		warnx("%s: failed to schedule routing table query for net=%u eid=%u: %s",
+		      __func__, peer->net, peer->eid, strerror(-rc));
+		free(rctx);
+	}
+	return rc;
 }
 
 static int on_i2c_smbus_find_location(sd_event_source *s, void *userdata)
@@ -4092,8 +4205,6 @@ static int method_link_discovery_notify(sd_bus_message *call, void *data,
 	dest_phys desti = { 0 }, *dest = &desti;
 	struct peer *peer = NULL;
 	int rc;
-	mctp_eid_t ret_eid;
-	uint8_t ret_ep_type, ret_medium_spec;
 
 	dest->ifindex = link->ifindex;
 
@@ -4121,10 +4232,34 @@ static int method_link_discovery_notify(sd_bus_message *call, void *data,
 				if (dest->hwaddr_len == MCTP_I3C_PHYS_ADDR_LEN) {
 					uint64_t pid = extract_i3c_pid(dest->hwaddr);
 					uint16_t masked_pid = (uint16_t)(pid & 0xFF0F);
-					if (dev->pid_mask != 0 && masked_pid == dev->pid_mask) {
+					bool matched = false;
+
+					/* Regex match against full 12-char hex PID
+					 * string (matches mctp-ext sysfs `pid` format)
+					 */
+					if (dev->pid_regex_valid) {
+						char pid_str[2 * MCTP_I3C_PHYS_ADDR_LEN + 1];
+						snprintf(pid_str, sizeof(pid_str),
+							 "%02x%02x%02x%02x%02x%02x",
+							 dest->hwaddr[0], dest->hwaddr[1],
+							 dest->hwaddr[2], dest->hwaddr[3],
+							 dest->hwaddr[4], dest->hwaddr[5]);
+						if (regexec(&dev->pid_regex, pid_str, 0, NULL, 0) == 0) {
+							matched = true;
+						}
+					}
+
+					/* Fallback: legacy 16-bit integer mask */
+					if (!matched && dev->pid_mask != 0 &&
+					    masked_pid == dev->pid_mask) {
+						matched = true;
+					}
+
+					if (matched) {
 						memcpy(dev->phys_addr, dest->hwaddr, dest->hwaddr_len);
-						warnx("Updated PID for non-target device %s (pid_mask 0x%04X)",
-							dev->interface, dev->pid_mask);
+						warnx("Updated PID for non-target device %s (pid_mask 0x%04X regex='%s')",
+							dev->interface, dev->pid_mask,
+							dev->pid_regex_valid ? dev->pid_regex_str : "");
 					}
 				}
 			}
@@ -4135,13 +4270,6 @@ static int method_link_discovery_notify(sd_bus_message *call, void *data,
 	if (rc < 0)
 		goto err;
 
-	peer = find_peer_by_phys(ctx, dest);
-	/* already known? */
-	if (peer) {
-		return sd_bus_reply_method_return(call, "sb",
-						  path_from_peer(peer), false);
-	}
-
 	if (phys_binding == MCTP_PHYS_BINDING_I3C &&
 	    link->role == ENDPOINT_ROLE_BUS_OWNER) {
 		mctp_eid_t static_eid = i3c_lookup_static_eid(&ctx->i3c_config,
@@ -4150,55 +4278,22 @@ static int method_link_discovery_notify(sd_bus_message *call, void *data,
 		if (rc < 0) {
 			warnx("I3C endpoint_assign_eid failed: %d", rc);
 			peer = NULL; // endpoint_assign_eid already removed peer on failure
-			goto try_get_eid;
+			return sd_bus_reply_method_return(call, "b", 0);
 		}
 
 		peer_path = path_from_peer(peer);
 		if (!peer_path)
 			goto err;
-		return sd_bus_reply_method_return(call, "sb", peer_path, 1);
-	}
-try_get_eid:
-	rc = query_get_endpoint_id(ctx, dest, &ret_eid, &ret_ep_type,
-				   &ret_medium_spec, NULL);
-	if (rc) {
-		warnx("Error getting endpoint id. error %d %s",
-		      rc, strerror(-rc));
-		goto err;
-	} 
-
-	rc = add_peer(ctx, dest, ret_eid, mctp_nl_net_byindex(ctx->nl, link->ifindex), &peer, true);
-	if (rc) {
-		warnx("can't add peer: %s", strerror(-rc));
-		goto err;
-	}
-	bool is_bridge = GET_MCTP_GET_EID_EP_TYPE(ret_ep_type) ==
-			 MCTP_GET_EID_EP_TYPE_BRIDGE;
-
-	if (is_bridge) {
-		peer->pool_size = 1;
-		peer->endpoint_type = ret_ep_type;
-		peer->medium_spec = ret_medium_spec;
+		return sd_bus_reply_method_return(call, "b", 1);
 	}
 
-	//Add peer route and neighbor entry
-	add_peer_route(peer);
-
-	query_peer_properties(peer);
-
-	publish_peer(peer);
-
-	peer_path = path_from_peer(peer);
-	if (!peer_path)
-		goto err;
-	return sd_bus_reply_method_return(call, "sb", peer_path, 1);
+	return sd_bus_reply_method_return(call, "b", 1);
 err:
 	if (peer) {
 		remove_peer(peer);
 	}
-
-	set_berr(ctx, rc, berr);
-	return rc;
+	warnx("%s: discovery notify failed: %s", __func__, strerror(-rc));
+	return sd_bus_reply_method_return(call, "b", 0);
 }
 
 /* SetupEndpoint method tries the following in order:
@@ -5015,7 +5110,7 @@ static int peer_endpoint_recover(sd_event_source *s, uint64_t usec,
 		}
 
 		/* Confirmation of the same device, apply its already allocated EID */
-		rc = endpoint_send_set_endpoint_id(peer, &new_eid, NULL);
+		rc = endpoint_send_set_endpoint_id(peer, &new_eid, NULL, false);
 		if (rc < 0) {
 			goto reschedule;
 		}
@@ -6192,9 +6287,8 @@ static const sd_bus_vtable bus_link_vtable[] = {
 	SD_BUS_METHOD_WITH_NAMES("DiscoveryNotify",
 		"ay",
 		SD_BUS_PARAM(physaddr),
-		"sb",
-		SD_BUS_PARAM(path)
-		SD_BUS_PARAM(found),
+		"b",
+		SD_BUS_PARAM(success),
 		method_link_discovery_notify,
 		0),	
 	SD_BUS_WRITABLE_PROPERTY("Role",
@@ -6894,26 +6988,54 @@ static int add_interface(struct ctx *ctx, int ifindex)
 	link->role = ctx->default_role;
 	/* Use the `mode` setting in conf/mctp.conf */
 	if (phys_binding == MCTP_PHYS_BINDING_PCIE_VDM) {
-		if (ctx->pcie_role == ENDPOINT_ROLE_ENDPOINT)
-			link->role = ENDPOINT_ROLE_ENDPOINT;
-		else 
+		/* Look up per-interface PCIe role from pcie_config. */
+		for (int i = 0; i < ctx->pcie_config.num_interfaces; i++) {
+			struct pcie_interface_config *pcfg =
+				&ctx->pcie_config.interfaces[i];
+			if (pcfg->interface[0] &&
+			    strcmp(pcfg->interface, ifname) == 0) {
+				if (!pcfg->enabled) {
+					warnx("PCIe link %s config '%s' is disabled, skipping MCTP setup",
+					      ifname, pcfg->name);
+					free(link);
+					return 0;
+				}
+				if (pcfg->role[0]) {
+					if (strcmp(pcfg->role, "endpoint") == 0)
+						link->role =
+							ENDPOINT_ROLE_ENDPOINT;
+					else if (strcmp(pcfg->role, "bus-owner") == 0)
+						link->role =
+							ENDPOINT_ROLE_BUS_OWNER;
+					else
+						warnx("PCIe link %s: unknown role '%s', keeping default",
+						      ifname, pcfg->role);
+				}
+				warnx("PCIe link %s matched config '%s', role=%s",
+				      ifname, pcfg->name, pcfg->role);
+				break;
+			}
+		}
+		if (link->role != ENDPOINT_ROLE_ENDPOINT)
 			link->challenge = true;
 	} 
 
 	if (phys_binding == MCTP_PHYS_BINDING_I3C) {
 		/* Look up link role from i3c_config device matching this interface.
-		 * JSON role describes the remote device:
-		 *   "bus-owner" -> BMC is endpoint -> ENDPOINT_ROLE_ENDPOINT
-		 *   "endpoint"  -> BMC is bus owner -> ENDPOINT_ROLE_BUS_OWNER
+		 * JSON role describes the BMC's own role on this link:
+		 *   "bus-owner" -> ENDPOINT_ROLE_BUS_OWNER
+		 *   "endpoint"  -> ENDPOINT_ROLE_ENDPOINT
 		 */
 		for (int i = 0; i < ctx->i3c_config.num_devices; i++) {
 			struct i3c_device *dev = &ctx->i3c_config.devices[i];
 			if (strcmp(dev->interface, ifname) == 0) {
-				if (strcmp(dev->role, "bus-owner") == 0) {
+				if (strcmp(dev->role, "endpoint") == 0) {
 					link->role = ENDPOINT_ROLE_ENDPOINT;
 				} else {
 					link->role = ENDPOINT_ROLE_BUS_OWNER;
 				}
+				warnx("I3C link %s matched device %s, role=%s",
+				      ifname, dev->name, dev->role);
 				break;
 			}
 		}
@@ -7205,24 +7327,12 @@ static void init_i3c_defaults(struct ctx *ctx)
 #else
 	ctx->i3c_config.num_devices = 0;
 #endif
-
-	strncpy(ctx->i3c_config.platform_soc, DEFAULT_PLATFORM_SOC,
-	        sizeof(ctx->i3c_config.platform_soc) - 1);
-	ctx->i3c_config.platform_soc[sizeof(ctx->i3c_config.platform_soc) - 1] = '\0';
 }
 
 static int parse_config_i3c(struct ctx *ctx, toml_table_t *i3c)
 {
 	toml_datum_t val;
 	toml_array_t *devices_array;
-
-	/* Parse global i3c properties */
-	val = toml_string_in(i3c, "platform_soc");
-	if (val.ok) {
-			strncpy(ctx->i3c_config.platform_soc, val.u.s, sizeof(ctx->i3c_config.platform_soc) - 1);
-			warnx("I3C platform_soc: %s", ctx->i3c_config.platform_soc);
-			free(val.u.s);
-	}
 
 	/* Parse devices array: [[i3c.devices]] */
 	devices_array = toml_array_in(i3c, "devices");
@@ -7292,9 +7402,7 @@ static int parse_config_i3c(struct ctx *ctx, toml_table_t *i3c)
 
 		/* Generate interface name based on bus_num and is_i3c_target */
 		if (!dev->is_i3c_target) {
-			int bus_idx = (strcmp(ctx->i3c_config.platform_soc, "aspeed-2600") == 0 && dev->bus_num >= 2)
-			              ? (dev->bus_num) - 2 : dev->bus_num;
-			snprintf(dev->interface, INTERFACE_NAME_LEN, "mctpi3c%d", bus_idx);
+			snprintf(dev->interface, INTERFACE_NAME_LEN, "mctpi3c%d", dev->bus_num);
 		} else {
 			snprintf(dev->interface, INTERFACE_NAME_LEN, "mctpi3c-target%d", dev->bus_num);
 		}
@@ -7344,42 +7452,9 @@ static int parse_config_i3c(struct ctx *ctx, toml_table_t *i3c)
 	return 0;
 }
 
-static int parse_config_pcie_mode(struct ctx *ctx, const char *pcie_mode)
-{
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(roles); i++) {
-		const struct role *role = &roles[i];
-
-		if (!role->conf_val || strcmp(role->conf_val, pcie_mode))
-			continue;
-
-		ctx->pcie_role = role->role;
-		return 0;
-	}
-
-	warnx("invalid value '%s' for mode configuration", pcie_mode);
-	return -1;
-}
-
-static int parse_config_pcie(struct ctx *ctx, toml_table_t *pcie)
-{
-	toml_datum_t val;
-	int rc;
-
-	val = toml_string_in(pcie, "mctp_pcie_role");
-	if (val.ok) {
-		rc = parse_config_pcie_mode(ctx, val.u.s);
-		free(val.u.s);
-		if (rc)
-			return rc;
-	}
-	return 0;
-}
-
 static int parse_config(struct ctx *ctx)
 {
-	toml_table_t *conf_root, *mctp_tab, *bus_owner, *i3c, *pcie;
+	toml_table_t *conf_root, *mctp_tab, *bus_owner, *i3c;
 	bool conf_file_specified;
 	char errbuf[256] = { 0 };
 	const char *filename;
@@ -7401,7 +7476,6 @@ static int parse_config(struct ctx *ctx)
 		}
 		/* Load compile-time defaults even without config file */
 		init_i3c_defaults(ctx);
-		parse_config_pcie_mode(ctx, DEFAULT_PCIE_ROLE);
 		return rc;
 	}
 
@@ -7414,7 +7488,6 @@ static int parse_config(struct ctx *ctx)
 
 	/* Load compile-time defaults before TOML overrides */
 	init_i3c_defaults(ctx);
-	parse_config_pcie_mode(ctx, DEFAULT_PCIE_ROLE);
 
 	val = toml_string_in(conf_root, "mode");
 	if (val.ok) {
@@ -7444,13 +7517,6 @@ static int parse_config(struct ctx *ctx)
 		if (rc)
 			goto out_free;
 	}
-
-	pcie = toml_table_in(conf_root, "mctp_pcie");
-	if (pcie) {
-		rc = parse_config_pcie(ctx, pcie);
-		if (rc)
-			goto out_free;
-	}	
 	rc = 0;
 
 out_free:
@@ -7460,137 +7526,11 @@ out_close:
 	return rc;
 }
 
-static int parse_json(struct ctx *ctx)
+/* Adapter for mctp-config.c loaders; pcie_role is now per-interface only. */
+static int mctpd_set_pcie_role(void *user, const char *role)
 {
-	const char *filename = MCTPD_JSON_FILE_DEFAULT;
-	struct json_object *root, *board, *exposes, *entry, *val;
-	const char *type_str;
-	int len, rc = 0;
-
-	root = json_object_from_file(filename);
-	if (!root) {
-		warnx("JSON config file not found at %s, skipping", filename);
-		return -1;
-	}
-
-	if (!json_object_is_type(root, json_type_array) ||
-	    json_object_array_length(root) == 0) {
-		warnx("Invalid JSON config format in %s", filename);
-		json_object_put(root);
-		return -1;
-	}
-
-	board = json_object_array_get_idx(root, 0);
-	if (!json_object_object_get_ex(board, "Exposes", &exposes)) {
-		warnx("No Exposes array in JSON config %s", filename);
-		json_object_put(root);
-		return -1;
-	}
-
-	len = json_object_array_length(exposes);
-	for (int i = 0; i < len; i++) {
-		entry = json_object_array_get_idx(exposes, i);
-		struct json_object *type_obj = NULL;
-		if (!json_object_object_get_ex(entry, "Type", &type_obj))
-			continue;
-		type_str = json_object_get_string(type_obj);
-
-		if (strcmp(type_str, "MCTPI3CConfiguration") == 0) {
-			if (json_object_object_get_ex(entry, "Soc", &val)) {
-				const char *soc = json_object_get_string(val);
-				strncpy(ctx->i3c_config.platform_soc, soc,
-					sizeof(ctx->i3c_config.platform_soc) - 1);
-				ctx->i3c_config.platform_soc[
-					sizeof(ctx->i3c_config.platform_soc) - 1] = '\0';
-				warnx("JSON I3C platform_soc: %s",
-				      ctx->i3c_config.platform_soc);
-			}
-		} else if (strcmp(type_str, "MCTPI3CTarget") == 0) {
-			if (ctx->i3c_config.num_devices >= MAX_I3C_DEVICES) {
-				warnx("JSON: too many I3C devices, skipping");
-				continue;
-			}
-			struct i3c_device *dev =
-				&ctx->i3c_config.devices[ctx->i3c_config.num_devices];
-			memset(dev, 0, sizeof(*dev));
-
-			if (json_object_object_get_ex(entry, "Name", &val)) {
-				strncpy(dev->name, json_object_get_string(val),
-					sizeof(dev->name) - 1);
-			}
-			if (json_object_object_get_ex(entry, "Bus", &val)) {
-				dev->bus_num = json_object_get_int(val);
-			}
-
-			/* Read Role field, default to "endpoint" */
-			const char *role_str = "endpoint";
-			if (json_object_object_get_ex(entry, "Role", &val)) {
-				role_str = json_object_get_string(val);
-			}
-			strncpy(dev->role, role_str, sizeof(dev->role) - 1);
-
-			/* Read I3CTarget, default based on role */
-			if (json_object_object_get_ex(entry, "I3CTarget", &val)) {
-				dev->is_i3c_target = json_object_get_boolean(val);
-			} else {
-				dev->is_i3c_target = (strcmp(dev->role, "bus-owner") != 0);
-			}
-
-			if (json_object_object_get_ex(entry, "PidMask", &val)) {
-				dev->pid_mask = (uint16_t)strtoul(
-					json_object_get_string(val), NULL, 0);
-			}
-			if (json_object_object_get_ex(entry, "SecondaryBusOwner", &val)) {
-				dev->is_secondary_bus_owner =
-					json_object_get_boolean(val);
-			}
-
-			/* Endpoint: read Address (6-byte PID array) */
-			if (json_object_object_get_ex(entry, "Address", &val)) {
-				int addr_len = json_object_array_length(val);
-				if (addr_len > MAX_ADDR_LEN)
-					addr_len = MAX_ADDR_LEN;
-				for (int j = 0; j < addr_len; j++) {
-					dev->phys_addr[j] = (uint8_t)json_object_get_int(
-						json_object_array_get_idx(val, j));
-				}
-			}
-
-			/* Read StaticEndpointID if present */
-			if (json_object_object_get_ex(entry, "StaticEndpointID", &val)) {
-				dev->static_eid = (mctp_eid_t)strtoul(
-					json_object_get_string(val), NULL, 0);
-			}
-
-			/* Generate interface name based on is_i3c_target */
-			if (!dev->is_i3c_target) {
-				int bus_num = (strcmp(ctx->i3c_config.platform_soc, "aspeed-2600") == 0)
-							? (dev->bus_num) - 2 : dev->bus_num;
-				snprintf(dev->interface, INTERFACE_NAME_LEN, "mctpi3c%d", bus_num);
-			} else {
-				snprintf(dev->interface, INTERFACE_NAME_LEN,
-					 "mctpi3c-target%d", dev->bus_num);
-			}
-
-			warnx("JSON I3C device: name=%s bus=%d role=%s is_i3c_target=%d iface=%s",
-			      dev->name, dev->bus_num, dev->role,
-			      dev->is_i3c_target, dev->interface);
-
-			ctx->i3c_config.num_devices++;
-		} else if (strcmp(type_str, "MCTPPCIeConfiguration") == 0) {
-			if (json_object_object_get_ex(entry, "Role", &val)) {
-				rc = parse_config_pcie_mode(ctx,
-					json_object_get_string(val));
-				if (rc) {
-					warnx("JSON: invalid PCIe role");
-				}
-			}
-		}
-	}
-
-	json_object_put(root);
-	warnx("JSON config loaded from %s: %d I3C device(s)",
-	      filename, ctx->i3c_config.num_devices);
+	(void)user;
+	(void)role;
 	return 0;
 }
 
@@ -7984,6 +7924,7 @@ int main(int argc, char **argv)
 {
 	struct ctx ctxi = { 0 }, *ctx = &ctxi;
 	int rc;
+	constexpr int retry_delay_secs = 10;
 
 	setlinebuf(stdout);
 
@@ -8004,8 +7945,37 @@ int main(int argc, char **argv)
 		err(EXIT_FAILURE, "Can't read configuration");
 	}
 
-	/* Override with JSON config if present */
-	parse_json(ctx);
+
+	/* Prefer Entity Manager if reachable; fall back to JSON file.
+	 * Retry up to 3 times with a delay if EM is not reachable.
+	 */
+	for (int em_attempt = 1; em_attempt <= 3; em_attempt++) {
+		/* Reset counts before each attempt: the loaders append to
+		 * num_devices/num_interfaces, so retrying without resetting
+		 * would duplicate entries from a partially-parsed attempt. */
+		ctx->i3c_config.num_devices = 0;
+		ctx->pcie_config.num_interfaces = 0;
+		rc = mctp_load_from_entity_manager(&ctx->i3c_config,
+						   &ctx->pcie_config,
+						   ctx->bus,
+						   mctpd_set_pcie_role, ctx);
+		if (rc > 0) {
+			warnx("Loaded MCTP configuration from Entity Manager: %d device(s) (attempt %d/3)",
+			      rc, em_attempt);
+			break;
+		}
+		warnx("sleeping %d seconds before retrying EM load attempt %d/3", retry_delay_secs, em_attempt);
+		sleep(retry_delay_secs);
+	}
+	if (rc <= 0) {
+		/* Override with JSON config if present */
+		rc = mctp_parse_json_file(&ctx->i3c_config,
+					  &ctx->pcie_config,
+					  MCTPD_JSON_FILE_DEFAULT,
+					  mctpd_set_pcie_role, ctx);
+		if (rc < 0)
+			warnx("JSON config not loaded or had errors (rc=%d); continuing with TOML/defaults", rc);
+	}
 
 	ctx->nl = mctp_nl_new(false);
 	if (!ctx->nl) {
@@ -8058,6 +8028,10 @@ int main(int argc, char **argv)
 	// Clean up all PID mappings on normal exit
 	pid_del_all_mappings(&ctx->i3c_config);
 
+	// Free any compiled PidMask regexes
+	for (int i = 0; i < ctx->i3c_config.num_devices; i++)
+		i3c_clear_regex(&ctx->i3c_config.devices[i]);
+
 	free_links(ctx);
 	free_peers(ctx);	
 	free_nets(ctx);
@@ -8068,3 +8042,5 @@ int main(int argc, char **argv)
 	destory_oem_pdk_hook();
 	return 0;
 }
+
+

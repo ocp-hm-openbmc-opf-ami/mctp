@@ -68,6 +68,11 @@ conf.set10('NUVOTON_SDK',
     get_option('nuvoton-sdk'),
     description: 'Enable Nuvoton SDK support')
 
+if get_option('mctp-i3c-multiple-bo-with-diff-eids')
+    conf.set('MCTP_I3C_MULTIPLE_BO_WITH_DIFF_EIDS', 1,
+        description: 'Enable support for multiple I3C bus owners with different EIDs')
+endif
+
 conf.set_quoted('MCTPD_CONF_FILE_DEFAULT',
     join_paths(get_option('prefix'), get_option('sysconfdir'), 'mctpd.conf'),
     description: 'Default configuration file path',
@@ -75,14 +80,6 @@ conf.set_quoted('MCTPD_CONF_FILE_DEFAULT',
 
 conf.set_quoted('MCTPD_JSON_FILE_DEFAULT',
     get_option('prefix') / get_option('datadir') / 'mctp/mctp_ext_options.json')
-
-conf.set_quoted('DEFAULT_PCIE_ROLE',
-    get_option('mctp-pcie-role'),
-    description: 'Default PCIe role: endpoint or bus-owner',
-)
-
-conf.set_quoted('DEFAULT_PLATFORM_SOC', get_option('platform-soc'),
-    description: 'Default platform SoC type for I3C')
 
 # Build I3C devices initializer from key=value pipe-delimited strings
 # Format: name=val|bus_num=val|pid_mask=val|device_pid=val|role=val|is_secondary_bus_owner=val|is_i3c_target=val
@@ -182,6 +179,7 @@ if libsystemd.found()
             'src/mctpd.c',
             'src/mctp-oem-extensions.c',
             'src/mctp-pid.c',
+            'src/mctp-config.c',
         ] + netlink_sources + util_sources + ops_sources,
         dependencies: [libsystemd, toml_dep, json_c_dep],
         install: true,
@@ -194,6 +192,7 @@ if libsystemd.found()
             'src/mctpd.c',
             'src/mctp-oem-extensions.c',
             'src/mctp-pid.c',
+            'src/mctp-config.c',
         ] + test_ops_sources + netlink_sources + util_sources,
         include_directories:  include_directories('src'),
         dependencies: [libsystemd, toml_dep, json_c_dep],

@@ -7,21 +7,14 @@ option('unsafe-writable-connectivity',
        description: 'Allow writes to the Connectivity member of the au.com.codeconstruct.MCTP.Endpoint1 interface on endpoint objects')
 option('tests', type: 'boolean', value: false)
 option(
-    'platform-soc',
-    type: 'combo',
-    choices: ['aspeed-2600', 'aspeed-2700', 'nuvoton'],
-    value: 'aspeed-2600',
-    description: 'Platform SoC type for I3C'
-)
-option(
     'mctp-i3c-devices',
     type: 'array',
     value: [],
     description: 'Default I3C devices list. Each element: name=val|bus_num=val|pid_mask=val|device_pid=val|role=val|is_secondary_bus_owner=val|is_i3c_target=val'
 )
 option(
-    'mctp-pcie-role',
-    type: 'combo',
-    choices: ['endpoint', 'bus-owner'],
-    value: 'endpoint',
-    description: 'Default PCIe role: endpoint or bus-owner')
+    'mctp-i3c-multiple-bo-with-diff-eids',
+    type: 'boolean',
+    value: true,
+    description: 'Enable support for multiple I3C bus owners with different EIDs'
+)
