@@ -14,6 +14,34 @@ cc = meson.get_compiler('c')
 
 add_project_arguments('-Wno-unused-parameter', language : 'c')
 
+# Test-only setup: It relaxes warning checks and install test dependencies.
+if get_option('tests')
+    add_project_arguments(
+           '-Wno-error',
+           '-Wno-pointer-arith',
+           '-Wno-format',
+           '-Wno-pedantic',
+           language: ['cpp','c'])
+
+    pip3 = find_program('pip3', required: true)
+    run_command(
+        pip3, 'install',
+        '--break-system-packages',
+        '--root-user-action=ignore',
+        '--quiet',
+        '-r', join_paths(meson.current_source_dir(), 'tests', 'requirements.txt'),
+        check: true,
+    )
+
+    # Add common user/system bin paths so pytest can be found.
+    python3_prog = find_program('python3', required: true)
+    user_base = run_command(
+        python3_prog, '-c', 'import site; print(site.USER_BASE)',
+        check: true,
+    ).stdout().strip()
+    pytest_search_dirs = [join_paths(user_base, 'bin'), '/usr/local/bin', '/usr/bin']
+endif
+
 libsystemd = dependency('libsystemd', version: '>=247', required: false)
 
 conf = configuration_data()
@@ -36,6 +64,14 @@ conf.set10('MCTPD_RECOVER_NIL_UUID',
 conf.set10('MCTPD_WRITABLE_CONNECTIVITY',
     get_option('unsafe-writable-connectivity'),
     description: 'Allow writes to the Connectivity member of the au.com.codeconstruct.MCTP.Endpoint1 interface on endpoint objects')
+conf.set10('NUVOTON_SDK',
+    get_option('nuvoton-sdk'),
+    description: 'Enable Nuvoton SDK support')
+
+if get_option('mctp-i3c-multiple-bo-with-diff-eids')
+    conf.set('MCTP_I3C_MULTIPLE_BO_WITH_DIFF_EIDS', 1,
+        description: 'Enable support for multiple I3C bus owners with different EIDs')
+endif
 
 conf.set_quoted('MCTPD_CONF_FILE_DEFAULT',
     join_paths(get_option('prefix'), get_option('sysconfdir'), 'mctpd.conf'),
@@ -44,14 +80,6 @@ conf.set_quoted('MCTPD_CONF_FILE_DEFAULT',
 
 conf.set_quoted('MCTPD_JSON_FILE_DEFAULT',
     get_option('prefix') / get_option('datadir') / 'mctp/mctp_ext_options.json')
-
-conf.set_quoted('DEFAULT_PCIE_ROLE',
-    get_option('mctp-pcie-role'),
-    description: 'Default PCIe role: endpoint or bus-owner',
-)
-
-conf.set_quoted('DEFAULT_PLATFORM_SOC', get_option('platform-soc'),
-    description: 'Default platform SoC type for I3C')
 
 # Build I3C devices initializer from key=value pipe-delimited strings
 # Format: name=val|bus_num=val|pid_mask=val|device_pid=val|role=val|is_secondary_bus_owner=val|is_i3c_target=val
@@ -151,6 +179,7 @@ if libsystemd.found()
             'src/mctpd.c',
             'src/mctp-oem-extensions.c',
             'src/mctp-pid.c',
+            'src/mctp-config.c',
         ] + netlink_sources + util_sources + ops_sources,
         dependencies: [libsystemd, toml_dep, json_c_dep],
         install: true,
@@ -163,6 +192,7 @@ if libsystemd.found()
             'src/mctpd.c',
             'src/mctp-oem-extensions.c',
             'src/mctp-pid.c',
+            'src/mctp-config.c',
         ] + test_ops_sources + netlink_sources + util_sources,
         include_directories:  include_directories('src'),
         dependencies: [libsystemd, toml_dep, json_c_dep],
@@ -211,7 +241,7 @@ if tests
     test_dir = join_paths(meson.current_source_dir(), 'tests')
     pytest_conf = join_paths(test_dir, 'pytest.ini')
 
-    pytest = find_program('pytest')
+    pytest = find_program('pytest', dirs: pytest_search_dirs)
     script = 'if [ ! -t 1 ]; then PFL="--tap"; fi; DBUS_STARTER_BUS_TYPE=user "@0@" $PFL --config-file "@1@" $@'.format(
       pytest.full_path(),
       pytest_conf,

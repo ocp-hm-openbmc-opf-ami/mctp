@@ -15,6 +15,7 @@
 #include <linux/rtnetlink.h>
 #include <linux/netdevice.h>
 
+#include "config.h"
 #include "mctp-control-spec.h"
 #include "mctp-netlink.h"
 #include "mctp.h"
@@ -1084,10 +1085,28 @@ int mctp_nl_hwaddr_len_byindex(const mctp_nl *nl, int index,
 uint8_t mctp_nl_phys_binding_byindex(const mctp_nl *nl, int index)
 {
 	struct linkmap_entry *entry = entry_byindex(nl, index);
-	if (!entry) {
+	if (!entry)
 		return MCTP_PHYS_BINDING_UNSPEC;
-	}
-	return entry->phys_binding;
+
+	if (entry->phys_binding != MCTP_PHYS_BINDING_UNSPEC)
+		return entry->phys_binding;
+
+#if NUVOTON_SDK
+	/* Infer binding from interface name when kernel does not report it */
+	const char *n = entry->ifname;
+	if (strncmp(n, "mctppci", 7) == 0)
+		return MCTP_PHYS_BINDING_PCIE_VDM;
+	if (strncmp(n, "mctpi2c", 7) == 0)
+		return MCTP_PHYS_BINDING_SMBUS;
+	if (strncmp(n, "mctpusb", 7) == 0)
+		return MCTP_PHYS_BINDING_USB;
+	if (strncmp(n, "mctpi3c", 7) == 0)
+		return MCTP_PHYS_BINDING_I3C;
+	if (strncmp(n, "mctpserial", 10) == 0)
+		return MCTP_PHYS_BINDING_SERIAL;
+#endif
+
+	return MCTP_PHYS_BINDING_UNSPEC;
 }
 
 mctp_eid_t *mctp_nl_addrs_byindex(const mctp_nl *nl, int index, size_t *ret_num)

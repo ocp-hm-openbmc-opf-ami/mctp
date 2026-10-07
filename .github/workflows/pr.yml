@@ -9,7 +9,7 @@ jobs:
       - name: Install system build dependencies
         run: >
           sudo apt-get update &&
-          sudo apt-get install libsystemd-dev ninja-build
+          sudo apt-get install libsystemd-dev libjson-c-dev ninja-build
 
       - name: Install meson
         run: pip install --user meson
@@ -49,7 +49,7 @@ jobs:
       - name: Install system build dependencies
         run: >
           sudo apt-get update &&
-          sudo apt-get install ninja-build
+          sudo apt-get install libjson-c-dev ninja-build
 
       - name: Install meson
         run: pip install --user meson
