@@ -7924,7 +7924,7 @@ int main(int argc, char **argv)
 {
 	struct ctx ctxi = { 0 }, *ctx = &ctxi;
 	int rc;
-	constexpr int retry_delay_secs = 10;
+	const int retry_delay_secs = 10;
 
 	setlinebuf(stdout);
 
