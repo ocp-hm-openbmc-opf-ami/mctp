@@ -58,7 +58,7 @@ async def test_respond_get_eid_with_no_eid(dbus, mctpd):
     # no EID yet
     cmd = MCTPControlCommand(True, 0, 0x02)
     rsp = await bo.send_control(mctpd.network.mctp_socket, cmd)
-    assert rsp.hex(' ') == '00 02 00 00 02 00'
+    assert rsp.hex(' ') == '00 02 00 00 00 00'
 
 
 async def test_accept_set_eid(dbus, mctpd):
@@ -71,7 +71,7 @@ async def test_accept_set_eid(dbus, mctpd):
     rsp = await bo.send_control(
         mctpd.network.mctp_socket, MCTPControlCommand(True, 0, 0x02)
     )
-    assert rsp.hex(' ') == '00 02 00 00 02 00'
+    assert rsp.hex(' ') == '00 02 00 00 00 00'
 
     # set EID = 42
     rsp = await bo.send_control(
@@ -84,7 +84,7 @@ async def test_accept_set_eid(dbus, mctpd):
     rsp = await bo.send_control(
         mctpd.network.mctp_socket, MCTPControlCommand(True, 0, 0x02)
     )
-    assert rsp.hex(' ') == '00 02 00 42 02 00'
+    assert rsp.hex(' ') == '00 02 00 42 00 00'
 
 
 async def test_accept_multiple_set_eids_for_single_interface(dbus, mctpd):
@@ -100,7 +100,7 @@ async def test_accept_multiple_set_eids_for_single_interface(dbus, mctpd):
     rsp = await bo.send_control(
         mctpd.network.mctp_socket, MCTPControlCommand(True, 0, 0x02)
     )
-    assert rsp.hex(' ') == '00 02 00 00 02 00'
+    assert rsp.hex(' ') == '00 02 00 00 00 00'
 
     # set EID = 42
     first_eid = 42
@@ -114,7 +114,7 @@ async def test_accept_multiple_set_eids_for_single_interface(dbus, mctpd):
     rsp = await bo.send_control(
         mctpd.network.mctp_socket, MCTPControlCommand(True, 0, 0x02)
     )
-    assert rsp.hex(' ') == f'00 02 00 {first_eid:02x} 02 00'
+    assert rsp.hex(' ') == f'00 02 00 {first_eid:02x} 00 00'
 
     # set EID = 66
     second_eid = 66
@@ -128,7 +128,7 @@ async def test_accept_multiple_set_eids_for_single_interface(dbus, mctpd):
     rsp = await bo.send_control(
         mctpd.network.mctp_socket, MCTPControlCommand(True, 0, 0x02)
     )
-    assert rsp.hex(' ') == f'00 02 00 {second_eid:02x} 02 00'
+    assert rsp.hex(' ') == f'00 02 00 {second_eid:02x} 00 00'
 
     # expect previous EID removed on D-Bus
     with pytest.raises(asyncdbus.errors.DBusError) as ex:
@@ -171,7 +171,7 @@ class TestDiscovery:
         rsp = await bo.send_control(
             mctpd.network.mctp_socket, MCTPControlCommand(True, 0, 0x02)
         )
-        assert rsp.hex(' ') == '00 02 00 00 02 00'
+        assert rsp.hex(' ') == '00 02 00 00 00 00'
 
         # BMC response to Prepare for Discovery
         rsp = await bo.send_control(
@@ -213,8 +213,11 @@ class TestUnsupportedDiscovery:
         """Discovery command on unsupported interface"""
         bo = mctpd.network.endpoints[0]
 
-        # BMC response ERROR_UNSUPPORTED_CMD to Prepare for Discovery
+        # NOTE: Prior to b22e529, discovery was gated by physical binding
+        # (introduced in 67f8f16), so SMBus returned ERROR_UNSUPPORTED_CMD
+        # (0x05). Since discovery is now gated only by endpoint role, endpoint-
+        # mode SMBus links succeed. Updated to match current behavior.
         rsp = await bo.send_control(
             mctpd.network.mctp_socket, MCTPControlCommand(True, 0, 0x0B)
         )
-        assert rsp.hex(' ') == '00 0b 05'
+        assert rsp.hex(' ') == '00 0b 00'
