@@ -10,6 +10,7 @@
 #include <sys/ioctl.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <err.h>
@@ -21,7 +22,7 @@
  * @param eid Endpoint ID to validate
  * @return true if EID is valid, false otherwise
  */
-bool is_eid_valid(uint8_t eid)
+bool i3c_is_eid_valid(uint8_t eid)
 {
     if (eid < 0x08 || eid == 0xFF)
         return false;
@@ -90,7 +91,7 @@ int pid_set_kernel_mapping(mctp_eid_t eid, const void* pid)
  */
 int pid_del_kernel_mapping(mctp_eid_t eid)
 {
-    if (!is_eid_valid(eid))
+    if (!i3c_is_eid_valid(eid))
     {
 		warnx("invalid EID, unable to delete PID Mapping");
         return -1;
@@ -248,12 +249,12 @@ int pid_del_all_mappings(struct i3c_config *cfg)
 }
 
 /**
- * is_busowner_addr - Check if hardware address matches busowner devices
+ * i3c_is_busowner_addr - Check if hardware address matches busowner devices
  * @config: I3C configuration
  * @type: Match type (BUSOWNER_ADDR_ANY, BUSOWNER_ADDR_PRIMARY, or BUSOWNER_ADDR_SECONDARY)
  * @hwaddr: Hardware address to check
  */
-bool is_busowner_addr(struct i3c_config *config, int type, const uint8_t *hwaddr)
+bool i3c_is_busowner_addr(struct i3c_config *config, int type, const uint8_t *hwaddr)
 {
 	if (!config || !hwaddr) {
 		return false;
@@ -262,7 +263,7 @@ bool is_busowner_addr(struct i3c_config *config, int type, const uint8_t *hwaddr
 	for (int i = 0; i < config->num_devices; i++) {
 		struct i3c_device *dev = &config->devices[i];
 
-		if (strcmp(dev->role, "bus-owner") != 0)
+		if (strcmp(dev->role, "endpoint") != 0)
 			continue;
 
 		if (memcmp(hwaddr, dev->phys_addr, MCTP_I3C_PHYS_ADDR_LEN) != 0)
@@ -286,14 +287,14 @@ bool is_busowner_addr(struct i3c_config *config, int type, const uint8_t *hwaddr
 	return false;
 }
 
-bool is_primary_busowner_addr(struct i3c_config *config, const uint8_t *hwaddr)
+bool i3c_is_primary_busowner_addr(struct i3c_config *config, const uint8_t *hwaddr)
 {
-	return is_busowner_addr(config, BUSOWNER_ADDR_PRIMARY, hwaddr);
+	return i3c_is_busowner_addr(config, BUSOWNER_ADDR_PRIMARY, hwaddr);
 }
 
-bool is_secondary_busowner_addr(struct i3c_config *config, const uint8_t *hwaddr)
+bool i3c_is_secondary_busowner_addr(struct i3c_config *config, const uint8_t *hwaddr)
 {
-	return is_busowner_addr(config, BUSOWNER_ADDR_SECONDARY, hwaddr);
+	return i3c_is_busowner_addr(config, BUSOWNER_ADDR_SECONDARY, hwaddr);
 }
 
 /**
@@ -318,11 +319,11 @@ mctp_eid_t i3c_lookup_static_eid(struct i3c_config *config,
 }
 
 /**
- * is_busowner_interface - Check if interface name matches any I3C busowner device
+ * i3c_is_busowner_interface - Check if interface name matches any I3C busowner device
  * @config: I3C configuration
  * @ifname: Interface name to check
  */
-bool is_busowner_interface(struct i3c_config *config, const char *ifname)
+bool i3c_is_busowner_interface(struct i3c_config *config, const char *ifname)
 {
 	if (!config || !ifname)
 		return false;
@@ -330,11 +331,92 @@ bool is_busowner_interface(struct i3c_config *config, const char *ifname)
 	for (int i = 0; i < config->num_devices; i++) {
 		struct i3c_device *dev = &config->devices[i];
 
-		if (strcmp(dev->role, "bus-owner") != 0)
+		if (strcmp(dev->role, "endpoint") != 0)
 			continue;
 
 		if (strcmp(dev->interface, ifname) == 0)
 			return true;
 	}
 	return false;
+}
+
+/**
+ * i3c_find_by_name - Look up an i3c_device by name
+ * @config: I3C configuration
+ * @name: device name to match
+ *
+ * Returns the index in @config->devices, or -1 if not found.
+ */
+int i3c_find_by_name(struct i3c_config *config, const char *name)
+{
+	if (!config || !name)
+		return -1;
+
+	for (int i = 0; i < config->num_devices; i++) {
+		if (strncmp(config->devices[i].name, name,
+			    sizeof(config->devices[i].name)) == 0)
+			return i;
+	}
+	return -1;
+}
+
+/**
+ * i3c_set_pid_mask - Parse a PidMask string as either a regex or hex integer
+ * @dev: device to populate
+ * @s: PidMask string from JSON/TOML
+ *
+ * Numeric forms (e.g. "0x20a", "1234") populate dev->pid_mask only.
+ * Anything containing regex metacharacters is compiled into dev->pid_regex.
+ *
+ * Returns 0 on success, -1 on regex compile error.
+ */
+int i3c_set_pid_mask(struct i3c_device *dev, const char *s)
+{
+	if (!dev || !s || !*s)
+		return 0;
+
+	/* Detect regex metacharacters */
+	bool is_regex = false;
+	for (const char *p = s; *p; p++) {
+		if (strchr(".[](){}|*+?^$\\", *p)) {
+			is_regex = true;
+			break;
+		}
+	}
+
+	if (is_regex) {
+		strncpy(dev->pid_regex_str, s, sizeof(dev->pid_regex_str) - 1);
+		dev->pid_regex_str[sizeof(dev->pid_regex_str) - 1] = '\0';
+		int rc = regcomp(&dev->pid_regex, dev->pid_regex_str,
+				 REG_EXTENDED | REG_ICASE | REG_NOSUB);
+		if (rc != 0) {
+			char errbuf[128];
+			regerror(rc, &dev->pid_regex, errbuf, sizeof(errbuf));
+			warnx("Invalid PidMask regex '%s': %s",
+			      dev->pid_regex_str, errbuf);
+			dev->pid_regex_str[0] = '\0';
+			return -1;
+		}
+		dev->pid_regex_valid = true;
+		return 0;
+	}
+
+	/* Numeric form */
+	dev->pid_mask = (uint16_t)strtoul(s, NULL, 0);
+	return 0;
+}
+
+/**
+ * i3c_clear_regex - Free a compiled PidMask regex if present
+ * @dev: device whose regex should be released
+ */
+void i3c_clear_regex(struct i3c_device *dev)
+{
+	if (!dev)
+		return;
+	if (dev->pid_regex_valid) {
+		regfree(&dev->pid_regex);
+		dev->pid_regex_valid = false;
+		dev->pid_regex_str[0] = '\0';
+	}
 }

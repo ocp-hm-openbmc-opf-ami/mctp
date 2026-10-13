@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <dlfcn.h>
 #include <dirent.h>
+#include <err.h>
 #include "mctp-oem-extensions.h"
 #include <string.h>
 #include <unistd.h>
